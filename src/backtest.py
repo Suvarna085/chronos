@@ -3,20 +3,43 @@ import numpy as np
 import pandas as pd
 import pickle
 import os
-import glob
-from datetime import datetime
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
-import sys
+import yfinance as yf
+from calendar import monthrange
 
 # Import from your existing modules
 from transformer import MultiFeatureChronosModel
 from tokenizer import MultiFeatureScaler, MultiFeatureTokenizer
 
 
-class ChronosBacktester:
-    """Backtest the Chronos model on historical data"""
+def add_simple_features(df):
+    """Add basic technical indicators (same as training)"""
+    data = df.copy()
+    
+    # Returns
+    data['returns'] = data['Close'].pct_change() * 100
+    
+    # Moving averages
+    data['sma_7'] = data['Close'].rolling(window=7).mean()
+    data['sma_21'] = data['Close'].rolling(window=21).mean()
+    
+    # RSI
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+    rs = gain / (loss + 1e-8)
+    data['rsi'] = 100 - (100 / (1 + rs))
+    
+    # Volume ratio
+    data['volume_ratio'] = data['Volume'] / data['Volume'].rolling(window=20).mean()
+    
+    data = data.dropna()
+    return data
+
+
+class MonthlyForecaster:
+    """Forecast a specific month and compare with actual results"""
     
     def __init__(self, model_path, tokenized_data_dir, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -37,12 +60,12 @@ class ChronosBacktester:
             n_heads=config['n_heads'],
             n_layers=config['n_layers'],
             d_ff=config['d_ff'],
-            dropout=0.0  # No dropout for inference
+            dropout=0.0
         ).to(self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
-        print(f"✓ Model loaded (val_loss: {checkpoint['val_loss']:.4f})")
+        print(f"✓ Model loaded")
         
         # Load preprocessing artifacts
         print("\n=== Loading Preprocessing Artifacts ===")
@@ -58,374 +81,380 @@ class ChronosBacktester:
         print("✓ Tokenizer loaded")
         
         self.context_length = 128
-        self.prediction_length = 30
+        
+        # Check scaler format and extract base feature names
+        sample_key = list(self.scaler.scalers.keys())[0]
+        self.scaler_uses_tuples = isinstance(sample_key, tuple)
+        
+        # Extract just the feature names (without symbol)
+        if self.scaler_uses_tuples:
+            # feature_names like [('Open', 'AAPL'), ('High', 'AAPL'), ...]
+            # Extract just ['Open', 'High', ...]
+            self.base_feature_names = [f[0] if isinstance(f, tuple) else f for f in self.feature_names]
+        else:
+            self.base_feature_names = self.feature_names
     
-    def tokenize(self, data_dict):
-        """Tokenize continuous values"""
-        return self.tokenizer.tokenize(data_dict)
+    def get_context_and_target_data(self, symbol, year, month):
+        """Download historical context data and target month data"""
+        
+        # Target month dates
+        target_start = datetime(year, month, 1)
+        _, last_day = monthrange(year, month)
+        target_end = datetime(year, month, last_day)
+        
+        # Download 1 year before target month to ensure enough context
+        download_start = target_start - timedelta(days=365)
+        download_end = target_end + timedelta(days=5)
+        
+        print(f"\n{'='*70}")
+        print(f"DOWNLOADING DATA FOR {symbol}")
+        print(f"{'='*70}")
+        print(f"Target Month: {target_start.strftime('%B %Y')}")
+        print(f"Download Range: {download_start.strftime('%Y-%m-%d')} to {download_end.strftime('%Y-%m-%d')}")
+        
+        try:
+            df = yf.download(symbol, 
+                           start=download_start.strftime('%Y-%m-%d'),
+                           end=download_end.strftime('%Y-%m-%d'),
+                           progress=False,
+                           auto_adjust=True)
+            
+            if len(df) == 0:
+                print(f"❌ No data available for {symbol}")
+                return None, None, None
+            
+            print(f"✓ Downloaded {len(df)} total days")
+            
+            # Add technical features
+            df = add_simple_features(df)
+            
+            # Keep only needed columns
+            keep_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 
+                        'returns', 'sma_7', 'sma_21', 'rsi', 'volume_ratio']
+            df = df[keep_cols]
+            
+            # Extract target month data
+            target_mask = (df.index >= target_start) & (df.index <= target_end)
+            target_data = df[target_mask].copy()
+            
+            # Extract context data (128 days before target month)
+            context_data = df[df.index < target_start].tail(self.context_length)
+            
+            # Validation
+            if len(target_data) == 0:
+                print(f"❌ No trading data in {target_start.strftime('%B %Y')}")
+                return None, None, None
+            
+            if len(context_data) < self.context_length:
+                print(f"❌ Insufficient context: only {len(context_data)} days (need {self.context_length})")
+                print(f"   Try a later month or a stock with more history")
+                return None, None, None
+            
+            num_trading_days = len(target_data)
+            
+            print(f"\n✓ Context Data: {len(context_data)} days")
+            print(f"  From: {context_data.index[0].strftime('%Y-%m-%d')}")
+            print(f"  To:   {context_data.index[-1].strftime('%Y-%m-%d')}")
+            print(f"\n✓ Target Month: {num_trading_days} trading days")
+            print(f"  From: {target_data.index[0].strftime('%Y-%m-%d')}")
+            print(f"  To:   {target_data.index[-1].strftime('%Y-%m-%d')}")
+            
+            return context_data, target_data, num_trading_days
+            
+        except Exception as e:
+            print(f"❌ Download error: {e}")
+            return None, None, None
     
-    def detokenize(self, tokens_dict):
-        """Convert tokens back to continuous values"""
-        return self.tokenizer.detokenize(tokens_dict)
-    
-    def predict(self, context_tokens):
-        """
-        Generate predictions given context tokens
-        context_tokens: dict of {feature_name: np.array of shape [context_length]}
-        Returns: dict of {feature_name: np.array of shape [prediction_length]}
-        """
+    def generate_forecast(self, context_data, num_days, symbol):
+        """Generate predictions for the specified number of days"""
+        
+        print(f"\n{'='*70}")
+        print(f"GENERATING {num_days}-DAY FORECAST")
+        print(f"{'='*70}")
+        
+        # Prepare features - use the EXACT format from training
+        features_data = {}
+        for feat_name in self.feature_names:
+            if isinstance(feat_name, tuple):
+                # Feature name is like ('Open', 'AAPL')
+                base_feat = feat_name[0]
+                features_data[feat_name] = context_data[base_feat].values
+            else:
+                # Feature name is just 'Open'
+                features_data[feat_name] = context_data[feat_name].values
+        
+        # Scale and tokenize context
+        scaled = self.scaler.transform(features_data)
+        tokens = self.tokenizer.tokenize(scaled)
+        
+        # Debug: check token shapes
+        print(f"Token shapes: {[(feat, tokens[feat].shape) for feat in self.feature_names]}")
+        
+        # Prepare input tensor - ensure all features have same length
+        context_list = []
+        for feat in self.feature_names:
+            feat_tokens = tokens[feat]
+            if len(feat_tokens.shape) == 1:
+                context_list.append(feat_tokens)
+            else:
+                # If 2D, take first dimension
+                context_list.append(feat_tokens.flatten())
+        
+        # Verify all same length
+        lengths = [len(t) for t in context_list]
+        if len(set(lengths)) > 1:
+            print(f"⚠️  Warning: Token length mismatch: {dict(zip(self.feature_names, lengths))}")
+            # Trim all to minimum length
+            min_len = min(lengths)
+            context_list = [t[:min_len] for t in context_list]
+            print(f"   Trimmed all to length: {min_len}")
+        
+        context_array = np.stack(context_list, axis=1)
+        context_tensor = torch.LongTensor(context_array).unsqueeze(0).to(self.device)
+        
+        # Generate predictions day by day
+        predictions = {feat: [] for feat in self.feature_names}
+        current_seq = context_tensor.clone()
+        
+        print("Forecasting", end="", flush=True)
         with torch.no_grad():
-            # Prepare input [1, context_length, num_features]
-            context_list = [context_tokens[feat] for feat in self.feature_names]
-            context_array = np.stack(context_list, axis=1)  # [context_length, num_features]
-            context_tensor = torch.LongTensor(context_array).unsqueeze(0).to(self.device)
-            
-            # Generate predictions autoregressively
-            predictions = {feat: [] for feat in self.feature_names}
-            
-            current_seq = context_tensor.clone()
-            
-            for step in range(self.prediction_length):
-                # Forward pass
-                outputs = self.model(current_seq)  # List of [1, seq_len, vocab_size]
+            for step in range(num_days):
+                if step % 5 == 0:
+                    print(".", end="", flush=True)
                 
-                # Sample next token for each feature
+                outputs = self.model(current_seq)
+                
                 next_tokens = []
                 for feat_idx, logits in enumerate(outputs):
-                    # Get logits for last position
-                    last_logits = logits[:, -1, :]  # [1, vocab_size]
-                    
-                    # Greedy decoding (can also use sampling)
-                    next_token = torch.argmax(last_logits, dim=-1)  # [1]
+                    last_logits = logits[:, -1, :]
+                    next_token = torch.argmax(last_logits, dim=-1)
                     next_tokens.append(next_token)
-                    
-                    # Store prediction
                     predictions[self.feature_names[feat_idx]].append(next_token.item())
                 
-                # Append to sequence - stack tokens and add sequence dimension
-                next_tokens_tensor = torch.stack(next_tokens, dim=1)  # [1, num_features]
-                next_tokens_tensor = next_tokens_tensor.unsqueeze(1)  # [1, 1, num_features]
+                next_tokens_tensor = torch.stack(next_tokens, dim=1).unsqueeze(1)
                 current_seq = torch.cat([current_seq, next_tokens_tensor], dim=1)
-            
-            # Convert lists to arrays
-            for feat in self.feature_names:
-                predictions[feat] = np.array(predictions[feat])
         
-        return predictions
+        print(" Done!")
+        
+        # Convert to arrays
+        for feat in self.feature_names:
+            predictions[feat] = np.array(predictions[feat])
+        
+        # Detokenize and inverse scale
+        pred_scaled = self.tokenizer.detokenize(predictions)
+        pred_values = self.scaler.inverse_transform(pred_scaled)
+        
+        print(f"✓ Generated {num_days} days of predictions")
+        
+        return pred_values
     
-    def backtest_stock(self, stock_file):
-        """
-        Backtest on a single stock
-        Returns: dict of metrics
-        """
-        stock_name = os.path.basename(stock_file).split('_processed.csv')[0]
-        print(f"\n=== Backtesting {stock_name} ===")
+    def compare_and_evaluate(self, predictions, actual_data, symbol, year, month):
+        """Compare predictions with actual data and calculate metrics"""
         
-        # Load data
-        df = pd.read_csv(stock_file, index_col=0)
+        print(f"\n{'='*70}")
+        print(f"EVALUATION RESULTS")
+        print(f"{'='*70}")
         
-        # Handle the index - skip if first row is 'Ticker' or non-date
-        if df.index[0] == 'Ticker' or not df.index[0].replace('-', '').replace('/', '').isdigit():
-            df = df.iloc[1:]  # Skip first row
+        # Extract actual values - ensure 1D arrays
+        actual_close = actual_data['Close'].values.flatten()
         
-        # Now convert to datetime
-        df.index = pd.to_datetime(df.index, errors='coerce')
-        df = df[df.index.notna()]  # Remove any rows with invalid dates
+        # Get predictions for Close - handle different shapes
+        pred_close_raw = predictions['Close']
+        if len(pred_close_raw.shape) > 1:
+            pred_close = pred_close_raw.flatten()[:len(actual_close)]
+        else:
+            pred_close = pred_close_raw[:len(actual_close)]
         
-        # Prepare features
-        features_data = {}
-        for col in df.columns:
-            values = pd.to_numeric(df[col], errors='coerce').values
-            values = values[~np.isnan(values)]
-            features_data[col] = values
+        # Price metrics
+        mae = np.mean(np.abs(pred_close - actual_close))
+        mape = np.mean(np.abs((pred_close - actual_close) / (actual_close + 1e-8))) * 100
+        rmse = np.sqrt(np.mean((pred_close - actual_close) ** 2))
         
-        # Scale and tokenize
-        scaled = self.scaler.transform(features_data)
-        tokens = self.tokenize(scaled)
+        # Direction prediction
+        pred_change = pred_close[-1] - pred_close[0]
+        actual_change = actual_close[-1] - actual_close[0]
+        pred_direction = "UP" if pred_change > 0 else "DOWN"
+        actual_direction = "UP" if actual_change > 0 else "DOWN"
+        direction_correct = (pred_direction == actual_direction)
         
-        # Generate test windows
-        total_len = len(list(tokens.values())[0])
-        num_tests = (total_len - self.context_length - self.prediction_length) // self.prediction_length
+        # Price change percentages
+        pred_pct = (pred_change / pred_close[0]) * 100
+        actual_pct = (actual_change / actual_close[0]) * 100
         
-        if num_tests < 1:
-            print(f"⚠ Not enough data for backtesting {stock_name}")
-            return None
+        # Display results
+        month_name = datetime(year, month, 1).strftime('%B %Y')
+        print(f"\n📅 Period: {month_name}")
+        print(f"📈 Stock: {symbol}")
+        print(f"📊 Trading Days: {len(actual_close)}")
         
-        # Store results
-        all_predictions = []
-        all_actuals = []
-        test_dates = []
+        print(f"\n{'─'*70}")
+        print("PRICE ACCURACY METRICS")
+        print(f"{'─'*70}")
+        print(f"  Mean Absolute Error (MAE):  ${mae:.2f}")
+        print(f"  Mean Abs Percentage Error:   {mape:.2f}%")
+        print(f"  Root Mean Squared Error:     ${rmse:.2f}")
         
-        print(f"Running {num_tests} backtest windows...")
-        for i in tqdm(range(num_tests)):
-            start_idx = i * self.prediction_length
-            end_idx = start_idx + self.context_length
-            pred_end_idx = end_idx + self.prediction_length
-            
-            if pred_end_idx > total_len:
-                break
-            
-            # Extract context
-            context = {feat: tokens[feat][start_idx:end_idx] for feat in self.feature_names}
-            
-            # Extract actual future values (tokens)
-            actual_tokens = {feat: tokens[feat][end_idx:pred_end_idx] for feat in self.feature_names}
-            
-            # Predict
-            pred_tokens = self.predict(context)
-            
-            # Detokenize predictions and actuals
-            pred_scaled = self.detokenize(pred_tokens)
-            actual_scaled = self.detokenize(actual_tokens)
-            
-            # Inverse transform to original scale
-            pred_values = self.scaler.inverse_transform(pred_scaled)
-            actual_values = self.scaler.inverse_transform(actual_scaled)
-            
-            all_predictions.append(pred_values)
-            all_actuals.append(actual_values)
-            
-            # Get date for this prediction
-            date_idx = end_idx - 1  # Last context point
-            if date_idx < len(df):
-                test_dates.append(df.index[date_idx])
+        print(f"\n{'─'*70}")
+        print("PRICE MOVEMENT COMPARISON")
+        print(f"{'─'*70}")
+        print(f"  Starting Price:  ${actual_close[0]:.2f}")
+        print(f"  Ending Price:    ${actual_close[-1]:.2f}")
+        print(f"  Actual Change:   ${actual_change:.2f} ({actual_pct:+.2f}%)")
+        print(f"  Predicted Change: ${pred_change:.2f} ({pred_pct:+.2f}%)")
         
-        # Calculate metrics
-        metrics = self.calculate_metrics(all_predictions, all_actuals, stock_name)
+        print(f"\n{'─'*70}")
+        print("DIRECTION PREDICTION")
+        print(f"{'─'*70}")
+        print(f"  Predicted: {pred_direction} {'⬆️' if pred_direction == 'UP' else '⬇️'}")
+        print(f"  Actual:    {actual_direction} {'⬆️' if actual_direction == 'UP' else '⬇️'}")
+        print(f"  Result:    {'✅ CORRECT' if direction_correct else '❌ INCORRECT'}")
+        
+        # Create visualization
+        self.create_comparison_plot(pred_close, actual_close, actual_data.index, 
+                                   symbol, year, month, mae, mape, direction_correct)
         
         return {
-            'stock': stock_name,
-            'metrics': metrics,
-            'predictions': all_predictions,
-            'actuals': all_actuals,
-            'dates': test_dates,
-            'df': df
+            'symbol': symbol,
+            'period': month_name,
+            'trading_days': len(actual_close),
+            'mae': mae,
+            'mape': mape,
+            'rmse': rmse,
+            'actual_change_pct': actual_pct,
+            'pred_change_pct': pred_pct,
+            'direction_correct': direction_correct,
+            'pred_direction': pred_direction,
+            'actual_direction': actual_direction
         }
     
-    def calculate_metrics(self, predictions, actuals, stock_name):
-        """Calculate prediction accuracy metrics"""
-        metrics = {}
+    def create_comparison_plot(self, predictions, actuals, dates, symbol, year, month, 
+                              mae, mape, direction_correct):
+        """Create detailed comparison visualization"""
         
-        # Focus on Close price for main metrics
-        close_idx = self.feature_names.index('Close')
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
         
-        pred_close = np.array([p['Close'] for p in predictions])  # [num_tests, pred_len]
-        actual_close = np.array([a['Close'] for a in actuals])
+        month_name = datetime(year, month, 1).strftime('%B %Y')
+        status = "✓ CORRECT" if direction_correct else "✗ WRONG"
+        fig.suptitle(f'{symbol} - {month_name} Forecast vs Actual [{status}]', 
+                    fontsize=16, fontweight='bold')
         
-        # 1. Mean Absolute Error (MAE)
-        mae = np.mean(np.abs(pred_close - actual_close))
-        metrics['MAE'] = mae
+        # Plot 1: Price comparison
+        x = range(len(actuals))
+        ax1.plot(x, predictions, label='Predicted', marker='o', linewidth=2.5, 
+                markersize=6, color='#2E86AB', alpha=0.8)
+        ax1.plot(x, actuals, label='Actual', marker='s', linewidth=2.5, 
+                markersize=6, color='#A23B72', alpha=0.8)
         
-        # 2. Mean Absolute Percentage Error (MAPE)
-        mape = np.mean(np.abs((pred_close - actual_close) / (actual_close + 1e-8))) * 100
-        metrics['MAPE'] = mape
+        ax1.set_xlabel('Trading Day', fontsize=12)
+        ax1.set_ylabel('Close Price ($)', fontsize=12)
+        ax1.set_title(f'Price Forecast (MAE: ${mae:.2f}, MAPE: {mape:.2f}%)', fontsize=13)
+        ax1.legend(fontsize=11, loc='best')
+        ax1.grid(True, alpha=0.3)
         
-        # 3. Root Mean Square Error (RMSE)
-        rmse = np.sqrt(np.mean((pred_close - actual_close) ** 2))
-        metrics['RMSE'] = rmse
+        # Add date labels
+        date_labels = [d.strftime('%m/%d') for d in dates]
+        step = max(1, len(date_labels) // 10)
+        ax1.set_xticks(x[::step])
+        ax1.set_xticklabels(date_labels[::step], rotation=45)
         
-        # 4. Direction Accuracy (did we predict up/down correctly?)
-        # Compare first and last values
-        pred_direction = np.sign(pred_close[:, -1] - pred_close[:, 0])
-        actual_direction = np.sign(actual_close[:, -1] - actual_close[:, 0])
-        direction_accuracy = np.mean(pred_direction == actual_direction) * 100
-        metrics['Direction_Accuracy'] = direction_accuracy
+        # Plot 2: Prediction errors
+        errors = predictions - actuals
+        colors = ['#d62728' if e < 0 else '#2ca02c' for e in errors]
+        ax2.bar(x, errors, color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+        ax2.axhline(0, color='black', linestyle='--', linewidth=1.5)
         
-        # 5. R² Score
-        ss_res = np.sum((actual_close - pred_close) ** 2)
-        ss_tot = np.sum((actual_close - np.mean(actual_close)) ** 2)
-        r2 = 1 - (ss_res / (ss_tot + 1e-8))
-        metrics['R2'] = r2
-        
-        # Print metrics
-        print(f"\n{stock_name} Metrics:")
-        print(f"  MAE:  ${mae:.2f}")
-        print(f"  MAPE: {mape:.2f}%")
-        print(f"  RMSE: ${rmse:.2f}")
-        print(f"  Direction Accuracy: {direction_accuracy:.1f}%")
-        print(f"  R²: {r2:.4f}")
-        
-        return metrics
-    
-    def plot_predictions(self, backtest_results, output_dir='../backtest_results'):
-        """Create visualization plots"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        stock_name = backtest_results['stock']
-        predictions = backtest_results['predictions']
-        actuals = backtest_results['actuals']
-        dates = backtest_results['dates']
-        
-        # Plot 1: First few predictions vs actuals
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'{stock_name} - Sample Predictions vs Actuals', fontsize=16)
-        
-        for idx, ax in enumerate(axes.flat):
-            if idx >= len(predictions):
-                break
-            
-            pred = predictions[idx]['Close']
-            actual = actuals[idx]['Close']
-            
-            ax.plot(pred, label='Predicted', marker='o', linewidth=2)
-            ax.plot(actual, label='Actual', marker='s', linewidth=2)
-            ax.set_title(f'Test Window {idx+1} ({dates[idx].strftime("%Y-%m-%d")})')
-            ax.set_xlabel('Days Ahead')
-            ax.set_ylabel('Close Price ($)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+        ax2.set_xlabel('Trading Day', fontsize=12)
+        ax2.set_ylabel('Error ($)', fontsize=12)
+        ax2.set_title('Daily Prediction Errors', fontsize=13)
+        ax2.grid(True, alpha=0.3, axis='y')
+        ax2.set_xticks(x[::step])
+        ax2.set_xticklabels(date_labels[::step], rotation=45)
         
         plt.tight_layout()
-        plt.savefig(f'{output_dir}/{stock_name}_sample_predictions.png', dpi=150)
+        
+        # Save plot
+        output_dir = '../backtest_results/monthly_forecasts'
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f'{symbol}_{year}_{month:02d}_forecast.png'
+        filepath = os.path.join(output_dir, filename)
+        plt.savefig(filepath, dpi=150, bbox_inches='tight')
         plt.close()
         
-        # Plot 2: Error distribution
-        all_errors = []
-        for pred, actual in zip(predictions, actuals):
-            errors = pred['Close'] - actual['Close']
-            all_errors.extend(errors)
-        
-        plt.figure(figsize=(10, 6))
-        plt.hist(all_errors, bins=50, edgecolor='black', alpha=0.7)
-        plt.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero Error')
-        plt.xlabel('Prediction Error ($)')
-        plt.ylabel('Frequency')
-        plt.title(f'{stock_name} - Prediction Error Distribution')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(f'{output_dir}/{stock_name}_error_distribution.png', dpi=150)
-        plt.close()
-        
-        print(f"✓ Plots saved to {output_dir}/")
+        print(f"\n✓ Chart saved: {filepath}")
 
 
-def run_full_backtest(model_path, tokenized_data_dir, dataset_dir):
-    """Run backtest on all stocks"""
+def main():
+    print("="*70)
+    print("MONTHLY STOCK FORECAST VALIDATOR")
+    print("="*70)
+    print("\nForecasts a specific month and compares predictions with actual results")
+    print("(Works best for months in 2025 - outside training data 2020-2024)")
     
-    print("=" * 60)
-    print("CHRONOS MODEL BACKTESTING")
-    print("=" * 60)
+    # User input
+    print("\n" + "-"*70)
+    symbol = input("Stock Symbol (e.g., AAPL, TSLA, MSFT): ").strip().upper()
     
-    # Initialize backtester
-    backtester = ChronosBacktester(model_path, tokenized_data_dir)
+    print("\nTarget Month to Forecast:")
+    year = int(input("  Year (e.g., 2025): ").strip())
+    month = int(input("  Month (1-12): ").strip())
     
-    # Find all stock files
-    stock_files = glob.glob(os.path.join(dataset_dir, '*_processed.csv'))
+    # Validation
+    if not (1 <= month <= 12):
+        print("❌ Invalid month. Must be between 1-12.")
+        return
     
-    if not stock_files:
-        print(f"❌ No stock files found in {dataset_dir}")
-        return None, None
+    target_date = datetime(year, month, 1)
+    current_date = datetime.now()
     
-    # Extract stock names
-    available_stocks = {}
-    for stock_file in stock_files:
-        stock_name = os.path.basename(stock_file).split('_processed.csv')[0]
-        available_stocks[stock_name.upper()] = stock_file
+    # Check if month is in the future
+    if target_date > current_date:
+        print(f"\n❌ Cannot forecast {target_date.strftime('%B %Y')} - it's in the future!")
+        print(f"   Current date: {current_date.strftime('%B %Y')}")
+        return
     
-    # Display available stocks
-    print(f"\nAvailable stocks for backtesting:")
-    for i, stock_name in enumerate(sorted(available_stocks.keys()), 1):
-        print(f"  {i}. {stock_name}")
-    
-    # Ask user which stock to backtest
-    print(f"\nEnter stock symbol(s) to backtest:")
-    print("  - Single stock: AAPL")
-    print("  - Multiple stocks: AAPL,GOOGL,MSFT")
-    print("  - All stocks: ALL")
-    
-    user_input = input("\nYour choice: ").strip().upper()
-    
-    # Determine which stocks to backtest
-    stocks_to_test = []
-    if user_input == "ALL":
-        stocks_to_test = list(available_stocks.keys())
-        print(f"\n✓ Backtesting all {len(stocks_to_test)} stocks")
-    else:
-        requested_stocks = [s.strip() for s in user_input.split(',')]
-        for stock in requested_stocks:
-            if stock in available_stocks:
-                stocks_to_test.append(stock)
-            else:
-                print(f"⚠ Warning: {stock} not found in dataset, skipping...")
-        
-        if not stocks_to_test:
-            print("❌ No valid stocks selected. Exiting.")
-            return None, None
-        
-        print(f"\n✓ Backtesting {len(stocks_to_test)} stock(s): {', '.join(stocks_to_test)}")
-    
-    # Run backtest on selected stocks
-    all_results = []
-    for stock_name in stocks_to_test:
-        stock_file = available_stocks[stock_name]
-        result = backtester.backtest_stock(stock_file)
-        if result:
-            all_results.append(result)
-            backtester.plot_predictions(result)
-    
-    if not all_results:
-        print("\n❌ No successful backtests completed.")
-        return None, None
-    
-    # Summary statistics
-    print("\n" + "=" * 60)
-    print("SUMMARY STATISTICS")
-    print("=" * 60)
-    
-    summary_df = pd.DataFrame([
-        {
-            'Stock': r['stock'],
-            'MAE': r['metrics']['MAE'],
-            'MAPE': r['metrics']['MAPE'],
-            'RMSE': r['metrics']['RMSE'],
-            'Direction_Acc': r['metrics']['Direction_Accuracy'],
-            'R²': r['metrics']['R2']
-        }
-        for r in all_results
-    ])
-    
-    print("\n" + summary_df.to_string(index=False))
-    
-    # Overall averages (only if multiple stocks)
-    if len(all_results) > 1:
-        print("\n" + "=" * 60)
-        print("OVERALL AVERAGES:")
-        print(f"  Average MAE:  ${summary_df['MAE'].mean():.2f}")
-        print(f"  Average MAPE: {summary_df['MAPE'].mean():.2f}%")
-        print(f"  Average RMSE: ${summary_df['RMSE'].mean():.2f}")
-        print(f"  Average Direction Accuracy: {summary_df['Direction_Acc'].mean():.1f}%")
-        print(f"  Average R²: {summary_df['R²'].mean():.4f}")
-        print("=" * 60)
-    
-    # Save summary
-    output_dir = os.path.join(os.path.dirname(dataset_dir), 'backtest_results')
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create filename with timestamp and stock names
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    stock_names = '_'.join(sorted(stocks_to_test))
-    if len(stock_names) > 50:  # If too long, use count
-        stock_names = f"{len(stocks_to_test)}stocks"
-    
-    summary_filename = f"summary_{stock_names}_{timestamp}.csv"
-    summary_path = os.path.join(output_dir, summary_filename)
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\n✓ Summary saved to {summary_path}")
-    
-    return all_results, summary_df
-
-
-if __name__ == "__main__":
+    # Warn if overlapping with training data
+    if year <= 2024:
+        print(f"\n⚠️  WARNING: {year} may overlap with training data (2020-2024)")
+        print("   Results may be overfitted. Consider testing on 2025 data.")
+        proceed = input("   Continue anyway? (y/n): ").strip().lower()
+        if proceed != 'y':
+            return
     
     # Setup paths
     SRC_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.dirname(SRC_DIR)
-    
     MODEL_PATH = os.path.join(PROJECT_ROOT, 'trained_models', 'chronos_best.pt')
     TOKENIZED_DATA_DIR = os.path.join(PROJECT_ROOT, 'tokenized_data')
-    DATASET_DIR = os.path.join(PROJECT_ROOT, 'datasets')
     
-    # Run backtest
-    results, summary = run_full_backtest(MODEL_PATH, TOKENIZED_DATA_DIR, DATASET_DIR)
+    # Check if model exists
+    if not os.path.exists(MODEL_PATH):
+        print(f"\n❌ Model not found at: {MODEL_PATH}")
+        return
     
-    print("\n✓ Backtesting complete!")
+    # Initialize forecaster
+    forecaster = MonthlyForecaster(MODEL_PATH, TOKENIZED_DATA_DIR)
+    
+    # Step 1: Get data
+    context_data, target_data, num_days = forecaster.get_context_and_target_data(
+        symbol, year, month
+    )
+    
+    if context_data is None:
+        print("\n❌ Failed to retrieve data. Exiting.")
+        return
+    
+    # Step 2: Generate forecast
+    predictions = forecaster.generate_forecast(context_data, num_days, symbol)
+    
+    # Step 3: Compare and evaluate
+    metrics = forecaster.compare_and_evaluate(predictions, target_data, symbol, year, month)
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print("✓ FORECAST VALIDATION COMPLETE")
+    print(f"{'='*70}")
+    print(f"\nResults saved to: ../backtest_results/monthly_forecasts/")
+
+
+if __name__ == "__main__":
+    main()
