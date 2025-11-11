@@ -1,0 +1,3 @@
+symbol,period,trading_days,mae,mape,rmse,r2,actual_change_pct,pred_change_pct,monthly_direction_correct,pred_direction,actual_direction,daily_accuracy,precision,recall,f1_score,specificity,confusion_matrix,true_positives,true_negatives,false_positives,false_negatives,total_days,actual_up_days,predicted_up_days
+TSLA,July 2025,22,19.729132936759427,6.3936888441657,23.38688075568311,-3.410279221712548,2.5140493410319915,6.588487766670179,True,UP,UP,0.6666666666666666,0.6363636363636364,0.7,0.6666666666666666,0.6363636363636364,"[[7 4]
+ [3 7]]",7,7,4,3,21,10,11

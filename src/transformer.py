@@ -21,6 +21,8 @@ class PositionalEncoding(nn.Module):
     
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
+    
+#so basically transformer doesn't have a sense of direction, in RNN it's inplicit, but in transformer, it sees all the tokens together, if we want our transformer to learn abt relationship which depend on order of tokens, we add  positional encoding
 
 
 class TransformerBlock(nn.Module):
@@ -60,7 +62,7 @@ class MultiFeatureChronosModel(nn.Module):
                  n_layers=6, d_ff=1024, dropout=0.1, max_len=1024):
         super().__init__()
         
-        self.d_model = d_model
+        self.d_model = d_model 
         self.num_features = num_features
         
         # Token embedding (shared across all features)
