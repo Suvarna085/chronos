@@ -1,119 +1,114 @@
-# Stock Price Prediction using Chronos Transformers
+# **Multi-Feature Time Series Transformer**
 
-A deep learning project that predicts stock prices using a transformer model inspired by Amazon's Chronos framework.
+This is an end-to-end Python project for stock market forecasting using a multi-feature, Chronos-style Transformer model.
 
-## What This Does
+The core idea is to adapt the [Chronos methodology](https://www.google.com/search?q=https://huggingface.co/blog/chronos) (which tokenizes a single time series using quantiles) and extend it to a multi-feature context. This model simultaneously learns from 10 different financial features (OHLCV, SMA, RSI, etc.) by tokenizing each one independently and feeding them into a custom Transformer architecture.
 
-Predicts stock prices 30 days into the future using historical data and technical indicators. Uses a transformer model that treats stock prices like language tokens.
+The project is structured as a complete pipeline:
 
-## Results
+1. **Data Collection** (load\_data.py)  
+2. **Preprocessing & Tokenization** (tokenizer.py)  
+3. **Model Training** (training.py)  
+4. **Backtesting & Evaluation** (backtest.py)
 
-**Training Stocks (TSLA, MSFT):**
-- TSLA: 97% direction accuracy, 4% error
-- MSFT: 74% direction accuracy, 2.7% error
+## **Key Features**
 
-**Unseen Stock (META):**
-- 43% direction accuracy, 9.4% error
-- **Conclusion:** Model learned specific stock patterns, not general market behavior
+* **Multi-Feature Model:** The MultiFeatureChronosModel in transformer.py is a custom Transformer that uses feature embeddings to learn from 10 different time series features at once.  
+* **Chronos-style Tokenization:** Implements a quantile-based tokenizer (MultiFeatureTokenizer) to convert continuous scaled data into discrete integer tokens, which is ideal for a Transformer's embedding layer.  
+* **End-to-End Pipeline:** All scripts are designed to run in sequence, creating the necessary data, artifacts, and models at each step.  
+* **Powerful Backtesting:** The backtest.py script is a powerful evaluation tool. It prompts you for a stock, year, and month, downloads fresh data, and runs a forecast. It then generates a detailed report comparing the forecast to the actual data, including:  
+  * **Regression Metrics:** MAE, MAPE, RMSE, and R².  
+  * **Directional Metrics:** Daily directional accuracy, precision, recall, and F1-score to see how well the model predicts "UP" vs. "DOWN" days.  
+  * **Visualization:** Saves a detailed chart and a CSV of the metrics.
 
-## Quick Start
+## **Project Structure**
 
-### Install
-```bash
-pip install torch pandas numpy yfinance matplotlib tqdm
-```
+The project assumes the following directory structure, which the scripts will create:
+  
+    .  
+    ├── src/  
+    │   ├── load\_data.py         \# 1\. Downloads and processes stock data  
+    │   ├── tokenizer.py         \# 2\. Scales, tokenizes, and windows the data  
+    │   ├── transformer.py       \# Defines the model architecture  
+    │   ├── training.py          \# 3\. Trains the model  
+    │   └── backtest.py          \# 4\. Evaluates the model on new data  
+    │  
+    ├── datasets/                \# Output of load\_data.py  
+    │   └── AAPL\_processed.csv  
+    │   └── ...  
+    │  
+    ├── tokenized\_data/          \# Output of tokenizer.py (artifacts)  
+    │   ├── all\_windows.pkl  
+    │   ├── feature\_names.pkl  
+    │   ├── scaler.pkl  
+    │   └── tokenizer.pkl  
+    │  
+    ├── trained\_models/          \# Output of training.py  
+    │   └── chronos\_best.pt  
+    │  
+    └── backtest\_results/        \# Output of backtest.py  
+        └── monthly\_forecasts/  
+            └── AAPL\_2025\_01\_forecast.png  
+            └── AAPL\_2025\_01\_metrics.csv  
+            └── ...
 
-### Run
-```bash
-# 1. Download data
-python src/load_data.py
+## **Requirements**
 
-# 2. Create training data
-python src/tokenizer.py
+You will need the following Python libraries. You can install them using pip:
 
-# 3. Train model
-python src/train.py
+    pip install torch numpy pandas yfinance scikit-learn matplotlib tqdm
 
-# 4. Test predictions
-python src/backtest.py
-```
+## **How to Use (The 4-Step Workflow)**
 
-## Project Structure
-```
-chronos/
-├── src/
-│   ├── load_data.py      # Get stock data
-│   ├── tokenizer.py         # Process data
-│   ├── transformer.py       # Model architecture
-│   ├── train.py            # Train model
-│   └── backtest.py         # Evaluate results
-├── datasets/               # Stock CSV files
-├── trained_models/         # Saved model
-└── backtest_results/       # Plots & metrics
-```
+Run the scripts from the command line in this order.
 
-## How It Works
+### **Step 1: Load and Process Data**
 
-1. **Data Collection:** Downloads OHLCV data + calculates technical indicators (RSI, moving averages)
-2. **Tokenization:** Converts prices to discrete tokens (like words in NLP)
-3. **Model:** Transformer with 4 layers, 8 attention heads, ~2M parameters
-4. **Training:** Learns patterns from 128-day windows to predict next 30 days
-5. **Prediction:** Generates forecasts autoregressively (one day at a time)
+This script downloads data for the stocks defined in STOCKS (default: 'AAPL', 'GOOGL', 'MSFT', etc.) from 2020 to 2024\. It adds technical indicators and saves the results to the ../datasets/ directory.
 
-## Metrics Explained
+    python src/load\_data.py
 
-- **Direction Accuracy:** Did we predict up/down correctly? (Random = 50%)
-- **MAPE:** Average % error in predictions
-- **R²:** How well model explains price movements (1.0 = perfect)
+### **Step 2: Tokenize Data and Build Windows**
 
-## Key Findings
+This script reads all the processed CSVs from ../datasets/. It fits a MultiFeatureScaler and MultiFeatureTokenizer on all the data, then creates sliding windows (context\_length=128, prediction\_length=30). It saves all artifacts (scaler, tokenizer, windows) to the ../tokenized\_data/ directory.
 
-✅ **Good:**
-- Works great on training data (74-97% direction accuracy)
-- Low prediction errors (~3-4% MAPE)
+    python src/tokenizer.py
 
-❌ **Problem:**
-- Poor on new stocks (43% accuracy = worse than guessing)
-- Model overfitted to specific companies
+### **Step 3: Train the Model**
 
-## Why It Failed on New Stocks
+This script loads the windows and artifacts from ../tokenized\_data/ and trains the MultiFeatureChronosModel. It uses a validation split, early stopping, and saves the best-performing model to ../trained\_models/chronos\_best.pt.
 
-- Only trained on 6 similar tech stocks
-- Learned company-specific patterns instead of general market dynamics
-- Needs more diverse training data (different sectors, market caps)
+**Note:** This step will take a significant amount of time, especially if you don't have a CUDA-enabled GPU.
 
-## Improvements Needed
+    python src/training.py
 
-1. **More Training Data:** Add 40+ stocks from finance, healthcare, energy sectors
-2. **Longer Training:** 200+ epochs instead of 100
-3. **Better Features:** Add market-wide indicators (VIX, sector indices)
+### **Step 4: Run a Backtest and Evaluate**
 
-**Expected Result:** 60-70% accuracy on unseen stocks (vs current 43%)
+This is the fun part\! Once the model is trained, you can run this script to test its performance on any stock for any past month. It works best on data *outside* the training range (e.g., any month in 2025).
 
-## Tech Stack
+The script will prompt you for input:
 
-- **PyTorch:** Model training
-- **yfinance:** Stock data
-- **Pandas/NumPy:** Data processing
-- **Matplotlib:** Visualization
+    python src/backtest.py
 
-## Testing on New Companies
+\# \--- Example Interaction \---  
+Stock Symbol (e.g., AAPL, TSLA, MSFT): MSFT
+    
+    Target Month to Forecast:  
+      Year (e.g., 2025): 2025  
+      Month (1-12): 1
 
-```bash
-python src/generalization_test.py
-# Enter: META (or any stock not in training data)
-```
+The script will then:
 
-## References
+1. Download the required data (e.g., MSFT for Jan 2025 and 128 days of context before it).  
+2. Generate a day-by-day forecast for the entire month.  
+3. Compare the forecast to the actual data.  
+4. Print a detailed metrics report to the console.  
+5. Save a chart and a metrics CSV to ../backtest\_results/monthly\_forecasts/.
 
-- [Chronos Paper](https://arxiv.org/abs/2403.07815) - Amazon's time series foundation model
-- Transformer architecture for sequence prediction
-- Quantile-based tokenization for continuous data
+## **Code Overview**
 
-## Author
-
-College project demonstrating deep learning for financial forecasting
-
----
-
-**Note:** This is a research project. Not for actual trading decisions.
+* src/load\_data.py: Fetches raw stock data from yfinance and adds 5 technical indicators: returns, sma\_7, sma\_21, rsi, and volume\_ratio. Total features: 10 (OHLCV \+ 5 indicators).  
+* src/tokenizer.py: Defines classes to scale, tokenize, and window the multi-feature data. This is the core of the data-processing pipeline.  
+* src/transformer.py: Defines the neural network architecture. MultiFeatureChronosModel is the key class, which includes token embeddings, feature-type embeddings, and positional encodings, followed by standard Transformer blocks and separate output heads for each feature.  
+* src/training.py: Standard PyTorch training loop. It loads the MultiFeatureDataset and trains the model, saving the best checkpoint based on validation loss.  
+* src/backtest.py: The user-facing evaluation script. It loads the trained model and artifacts to perform a comprehensive forecast analysis on new, unseen data.
